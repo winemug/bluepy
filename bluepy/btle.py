@@ -11,6 +11,8 @@ import binascii
 import select
 import struct
 import signal
+from queue import Queue, Empty
+from threading import Thread
 
 def preexec_function():
     # Ignore the SIGINT signal by setting the handler to the standard
@@ -262,8 +264,9 @@ class DefaultDelegate:
 class BluepyHelper:
     def __init__(self):
         self._helper = None
-        self._poller = None
+        self._lineq = None
         self._stderr = None
+        self._mtu = 0
         self.delegate = DefaultDelegate()
 
     def withDelegate(self, delegate_):
@@ -273,6 +276,8 @@ class BluepyHelper:
     def _startHelper(self,iface=None):
         if self._helper is None:
             DBG("Running ", helperExe)
+            self._lineq = Queue()
+            self._mtu = 0
             self._stderr = open(os.devnull, "w")
             args=[helperExe]
             if iface is not None: args.append(str(iface))
@@ -282,25 +287,24 @@ class BluepyHelper:
                                             stderr=self._stderr,
                                             universal_newlines=True,
                                             preexec_fn = preexec_function)
+            t = Thread(target=self._readToQueue)
+            t.daemon = True               # don't wait for it to exit
+            t.start()
 
-            self._poller = select.poll()
-            self._poller.register(self._helper.stdout, select.POLLIN)
+    def _readToQueue(self):
+        """Thread to read lines from stdout and insert in queue."""
+        while self._helper:
+            line = self._helper.stdout.readline()
+            if not line:                  # EOF
+                break
+            self._lineq.put(line)
 
     def _stopHelper(self):
         if self._helper is not None:
             DBG("Stopping ", helperExe)
-            self._poller.unregister(self._helper.stdout)
-            try:
-                self._helper.stdin.write("quit\n")
-                self._helper.stdin.flush()
-            except BrokenPipeError:
-                self._helper = None
-
-            if self._helper is not None and not self._helper.wait(5):
-                try:
-                    self._helper.kill()
-                except:
-                    pass
+            self._helper.stdin.write("quit\n")
+            self._helper.stdin.flush()
+            self._helper.wait()
             self._helper = None
         if self._stderr is not None:
             self._stderr.close()
@@ -310,15 +314,8 @@ class BluepyHelper:
         if self._helper is None:
             raise BTLEInternalError("Helper not started (did you call connect()?)")
         DBG("Sent: ", cmd)
-        try:
-            self._helper.stdin.write(cmd)
-            self._helper.stdin.flush()
-        except BrokenPipeError:
-            self._helper = None
-            if self._stderr is not None:
-                self._stderr.close()
-                self._stderr = None
-            raise BTLEInternalError("Disconnected from helper, try connecting again")
+        self._helper.stdin.write(cmd)
+        self._helper.stdin.flush()
 
     def _mgmtCmd(self, cmd):
         self._writeCmd(cmd + '\n')
@@ -354,13 +351,12 @@ class BluepyHelper:
             if self._helper.poll() is not None:
                 raise BTLEInternalError("Helper exited")
 
-            if timeout:
-                fds = self._poller.poll(timeout*1000)
-                if len(fds) == 0:
-                    DBG("Select timeout")
-                    return None
+            try:
+                rv = self._lineq.get(timeout=timeout)
+            except Empty:
+                DBG("Select timeout")
+                return None
 
-            rv = self._helper.stdout.readline()
             DBG("Got:", repr(rv))
             if rv.startswith('#') or rv == '\n' or len(rv)==0:
                 continue
@@ -370,6 +366,14 @@ class BluepyHelper:
                 raise BTLEInternalError("No response type indicator", resp)
 
             respType = resp['rsp'][0]
+
+            # always check for MTU updates
+            if 'mtu' in resp and len(resp['mtu']) > 0:
+                new_mtu = int(resp['mtu'][0])
+                if self._mtu != new_mtu:
+                    self._mtu = new_mtu
+                    DBG("Updated MTU: " + str(self._mtu))
+
             if respType in wantType:
                 return resp
             elif respType == 'stat':
@@ -430,8 +434,8 @@ class Peripheral(BluepyHelper):
                 data = resp['d'][0]
                 if self.delegate is not None:
                     self.delegate.handleNotification(hnd, data)
-                if respType not in wantType:
-                    continue
+            if respType not in wantType:
+                continue
             return resp
 
     def _connect(self, addr, addrType=ADDR_TYPE_PUBLIC, iface=None):
@@ -568,6 +572,9 @@ class Peripheral(BluepyHelper):
     def pair(self):
         self._mgmtCmd("pair")
 
+    def getMTU(self):
+        return self._mtu
+
     def setMTU(self, mtu):
         self._writeCmd("mtu %x\n" % mtu)
         return self._getResp('stat')
@@ -575,6 +582,7 @@ class Peripheral(BluepyHelper):
     def waitForNotifications(self, timeout):
          resp = self._getResp(['ntfy','ind'], timeout)
          return (resp != None)
+
     def _setRemoteOOB(self, address, address_type, oob_data, iface=None):
         if self._helper is None:
             self._startHelper(iface)
