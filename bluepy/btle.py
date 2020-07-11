@@ -302,20 +302,35 @@ class BluepyHelper:
     def _stopHelper(self):
         if self._helper is not None:
             DBG("Stopping ", helperExe)
-            self._helper.stdin.write("quit\n")
-            self._helper.stdin.flush()
-            self._helper.wait()
-            self._helper = None
-        if self._stderr is not None:
-            self._stderr.close()
-            self._stderr = None
+            try:
+                self._helper.stdin.write("quit\n")
+                self._helper.stdin.flush()
+                self._helper.wait(5)
+                self._helper.kill()
+            finally:
+                self._helper = None
+                if self._stderr is not None:
+                    self._stderr.close()
+                    self._stderr = None
 
-    def _writeCmd(self, cmd):
+    def _writeCmd(self, cmd, retry_on_broken_pipe=True):
         if self._helper is None:
             raise BTLEInternalError("Helper not started (did you call connect()?)")
         DBG("Sent: ", cmd)
-        self._helper.stdin.write(cmd)
-        self._helper.stdin.flush()
+        try:
+            self._helper.stdin.write(cmd)
+            self._helper.stdin.flush()
+        except BrokenPipeError:
+            self._helper = None
+            if self._stderr is not None:
+                self._stderr.close()
+                self._stderr = None
+
+            if retry_on_broken_pipe:
+                self._startHelper(iface=self.iface)
+                self._writeCmd(cmd, False)
+            else:
+                raise BTLEInternalError("Disconnected from helper, try connecting again")
 
     def _mgmtCmd(self, cmd):
         self._writeCmd(cmd + '\n')
